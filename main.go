@@ -11,15 +11,16 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// greeting is the fixed reply the bot sends to every human message.
-const greeting = "Hi, my name is Vibe Apply"
-
 // threadName is the fixed title for every thread the bot creates.
 const threadName = "Vibe Apply"
 
 // threadArchiveMinutes is how long a thread stays active without messages
 // before Discord auto-archives it (1440 = 1 day). New messages un-archive it.
 const threadArchiveMinutes = 1440
+
+// maxConcurrentReplies caps how many Claude subprocesses run at once so a burst
+// of messages can't overwhelm the machine.
+const maxConcurrentReplies = 3
 
 // action is what the bot should do in response to a message.
 type action int
@@ -66,6 +67,20 @@ func main() {
 	// message content arrives empty.
 	dg.Identify.Intents = discordgo.IntentsGuildMessages | discordgo.IntentMessageContent
 
+	// Isolate the Claude subprocess: run it from a temp dir outside $HOME so it
+	// doesn't auto-load project/user CLAUDE.md files (which would give it an
+	// unrelated persona). Combined with StrictMCPConfig + no tools in llm.go,
+	// this keeps replies fast, on-persona, and safe. (.env was loaded above.)
+	if workDir, err := os.MkdirTemp("", "vibe-apply-claude"); err != nil {
+		log.Printf("warning: could not create isolated work dir: %v", err)
+	} else if err := os.Chdir(workDir); err != nil {
+		log.Printf("warning: could not switch to isolated work dir: %v", err)
+	}
+
+	store := newSessionStore()
+	gen := newClaudeReplyGenerator()
+	sem := make(chan struct{}, maxConcurrentReplies)
+
 	dg.AddHandler(func(s *discordgo.Session, m *discordgo.MessageCreate) {
 		// resolve looks up a channel by ID: cached state first, REST as fallback.
 		// It is how we tell whether a message came from a thread under the
@@ -88,13 +103,11 @@ func main() {
 				log.Printf("failed to start thread on message %s: %v", m.ID, err)
 				return
 			}
-			if _, err := s.ChannelMessageSend(thread.ID, greeting); err != nil {
-				log.Printf("failed to greet in thread %s: %v", thread.ID, err)
-			}
+			// Generate off the Gateway goroutine so a slow reply never blocks
+			// heartbeats or other events.
+			go handleReply(s, gen, store, sem, thread.ID, buildUserMessage(m.Message))
 		case actionReplyInThread:
-			if _, err := s.ChannelMessageSendReply(m.ChannelID, greeting, m.Reference()); err != nil {
-				log.Printf("failed to reply in thread to message %s: %v", m.ID, err)
-			}
+			go handleReply(s, gen, store, sem, m.ChannelID, buildUserMessage(m.Message))
 		}
 	})
 
